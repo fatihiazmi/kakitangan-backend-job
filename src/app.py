@@ -5,7 +5,7 @@ This is the entrypoint. Routes are defined but most business logic
 in services.py needs to be implemented to make everything work.
 """
 
-from datetime import date
+from datetime import date, datetime
 from typing import Optional
 
 from fastapi import FastAPI, Depends, HTTPException, Query
@@ -15,11 +15,18 @@ from sqlalchemy.orm import Session
 from src.database import engine, get_db, Base
 from src.models import LeaveType, LeaveStatus
 from src import services
+from src.exceptions import LeaveError
 
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Kakitangan Leave Management API", version="0.1.0")
 
+# ── Helper ──────────────────────────────────────────────────────────────
+def raise_http_error(error: LeaveError) -> None:
+    raise HTTPException(
+        status_code=getattr(error, "status_code", 422),
+        detail=str(error),
+    )
 
 # ── Schemas ──────────────────────────────────────────────────────────────
 
@@ -62,7 +69,7 @@ class LeaveRequestOut(BaseModel):
     reason: Optional[str]
     status: LeaveStatus
     approved_by: Optional[int]
-    approved_at: Optional[str]
+    approved_at: Optional[datetime]
 
     class Config:
         from_attributes = True
@@ -108,8 +115,8 @@ def create_leave_request(body: LeaveRequestCreate, db: Session = Depends(get_db)
             start_date=body.start_date, end_date=body.end_date, reason=body.reason,
         )
         return lr
-    except services.LeaveError as e:
-        raise HTTPException(status_code=422, detail=str(e))
+    except LeaveError as e:
+        raise_http_error(e)
 
 
 @app.get("/leave-requests", response_model=PaginatedLeaveRequests)
@@ -153,8 +160,8 @@ def review_leave_request(
             db, leave_request_id=leave_request_id, approver_id=1, decision=body.decision,
         )
         return lr
-    except services.LeaveError as e:
-        raise HTTPException(status_code=422, detail=str(e))
+    except LeaveError as e:
+        raise_http_error(e)
 
 
 @app.post("/leave-requests/{leave_request_id}/cancel", response_model=LeaveRequestOut)
@@ -162,8 +169,8 @@ def cancel_leave_request(leave_request_id: int, employee_id: int = Query(...), d
     try:
         lr = services.cancel_leave_request(db, leave_request_id=leave_request_id, employee_id=employee_id)
         return lr
-    except services.LeaveError as e:
-        raise HTTPException(status_code=422, detail=str(e))
+    except LeaveError as e:
+        raise_http_error(e)
 
 
 @app.get("/leave-balances/{employee_id}", response_model=list[LeaveBalanceOut])
