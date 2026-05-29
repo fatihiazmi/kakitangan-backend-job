@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from sqlalchemy import Column, Integer, String, Float, Date, DateTime, ForeignKey, Enum as SqlEnum
 from sqlalchemy.orm import relationship
 import enum
@@ -31,11 +31,11 @@ class Employee(Base):
     department = Column(String, nullable=False)
     manager_id = Column(Integer, ForeignKey("employees.id"), nullable=True)
     joined_at = Column(Date, default=date.today)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=datetime.now(timezone.utc), onupdate=datetime.now(timezone.utc))
 
     manager = relationship("Employee", remote_side="Employee.id")
-    leave_requests = relationship("LeaveRequest", back_populates="employee")
+    leave_requests = relationship("LeaveRequest", back_populates="employee",foreign_keys="LeaveRequest.employee_id")
     leave_balances = relationship("LeaveBalance", back_populates="employee")
 
 
@@ -51,8 +51,8 @@ class LeaveRequest(Base):
     status = Column(SqlEnum(LeaveStatus), default=LeaveStatus.PENDING)
     approved_by = Column(Integer, ForeignKey("employees.id"), nullable=True)
     approved_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=datetime.now(timezone.utc), onupdate=datetime.now(timezone.utc))
 
     employee = relationship("Employee", back_populates="leave_requests", foreign_keys=[employee_id])
     approver = relationship("Employee", foreign_keys=[approved_by])
@@ -67,8 +67,8 @@ class LeaveBalance(Base):
     year = Column(Integer, nullable=False)
     total_days = Column(Float, nullable=False, default=0)
     used_days = Column(Float, nullable=False, default=0)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=datetime.now(timezone.utc), onupdate=datetime.now(timezone.utc))
 
     employee = relationship("Employee", back_populates="leave_balances")
 

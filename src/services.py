@@ -1,37 +1,41 @@
 """
 Business logic layer for leave management.
 
-Implement the following service functions to handle leave request workflows.
-Each function should raise appropriate exceptions for invalid operations
-(e.g., overlapping leave, insufficient balance, self-approval).
+This module exposes the public service functions used by the FastAPI routes.
+It coordinates validation, repository access, status transitions, and commits.
 """
 
-from datetime import date, datetime
+import logging
+from datetime import date, datetime, timezone
 from typing import Optional
 
 from sqlalchemy.orm import Session
 
-from src.models import Employee, LeaveRequest, LeaveBalance, LeaveType, LeaveStatus
+from src import repositories
+from src.exceptions import (
+    AuthorizationError,
+    CannotModifyApprovedLeaveError,
+    InsufficientBalanceError,
+    LeaveError,
+    OverlappingLeaveError,
+    SelfApprovalError,
+    ValidationError,
+    NotFoundError,
+)
+from src.leave_rules import (
+    calculate_leave_days,
+    ensure_leave_can_be_cancelled,
+    ensure_leave_can_be_reviewed,
+    validate_leave_date_range,
+)
+from src.models import Employee, LeaveBalance, LeaveRequest, LeaveType, LeaveStatus
+from src.service_helpers import (
+    get_balance_or_raise,
+    get_employee_or_raise,
+    get_leave_request_or_raise,
+)
 
-
-class LeaveError(Exception):
-    pass
-
-
-class InsufficientBalanceError(LeaveError):
-    pass
-
-
-class OverlappingLeaveError(LeaveError):
-    pass
-
-
-class SelfApprovalError(LeaveError):
-    pass
-
-
-class CannotModifyApprovedLeaveError(LeaveError):
-    pass
+logger = logging.getLogger(__name__)
 
 
 def create_leave_request(
@@ -42,17 +46,42 @@ def create_leave_request(
     end_date: date,
     reason: Optional[str] = None,
 ) -> LeaveRequest:
-    """
-    Create a new leave request.
-    Must validate:
-    - Employee exists
-    - start_date <= end_date
-    - start_date >= today (no back-dating)
-    - No overlapping leave requests for the same employee
-    - Employee has sufficient leave balance for the requested type
-    - end_date - start_date >= 0 (at least 1 day — or handle half-day logic)
-    """
-    raise NotImplementedError("Candidate must implement this")
+    get_employee_or_raise(db, employee_id)
+
+    try:
+        validate_leave_date_range(start_date, end_date)
+    except ValueError as exc:
+        raise LeaveError(str(exc)) from exc
+
+    if repositories.has_overlapping_leave(db, employee_id, start_date, end_date):
+        raise OverlappingLeaveError(
+            "Leave request overlaps with an existing pending or approved leave"
+        )
+
+    requested_days = calculate_leave_days(start_date, end_date)
+    balance = get_balance_or_raise(db, employee_id, leave_type, start_date.year)
+
+    if balance.remaining_days < requested_days:
+        raise InsufficientBalanceError(
+            f"Insufficient {leave_type.value} leave balance. "
+            f"Requested {requested_days} day(s), "
+            f"available {balance.remaining_days} day(s)"
+        )
+
+    leave_request = LeaveRequest(
+        employee_id=employee_id,
+        leave_type=leave_type,
+        start_date=start_date,
+        end_date=end_date,
+        reason=reason,
+        status=LeaveStatus.PENDING,
+    )
+
+    db.add(leave_request)
+    db.commit()
+    db.refresh(leave_request)
+
+    return leave_request
 
 
 def approve_leave_request(
@@ -61,16 +90,53 @@ def approve_leave_request(
     approver_id: int,
     decision: LeaveStatus,
 ) -> LeaveRequest:
-    """
-    Approve or reject a pending leave request.
-    Must validate:
-    - Leave request exists and is in PENDING status
-    - Approver is the employee's manager (or has approval authority)
-    - Approver is not the leave requester (no self-approval)
-    - On approval: deduct from leave balance
-    - On rejection: record reason in comment field if needed
-    """
-    raise NotImplementedError("Candidate must implement this")
+    if decision not in (LeaveStatus.APPROVED, LeaveStatus.REJECTED):
+        raise LeaveError("Decision must be either approved or rejected")
+
+    leave_request = get_leave_request_or_raise(db, leave_request_id)
+    approver = get_employee_or_raise(db, approver_id)
+
+    try:
+        ensure_leave_can_be_reviewed(leave_request)
+    except ValueError as exc:
+        raise CannotModifyApprovedLeaveError(str(exc)) from exc
+
+    if leave_request.employee_id == approver.id:
+        raise SelfApprovalError("Employees cannot approve their own leave requests")
+
+    if leave_request.employee.manager_id != approver.id:
+        raise LeaveError("Only the employee's manager can approve or reject this leave request")
+
+    if decision == LeaveStatus.APPROVED:
+        requested_days = calculate_leave_days(
+            leave_request.start_date,
+            leave_request.end_date,
+        )
+
+        balance = get_balance_or_raise(
+            db,
+            leave_request.employee_id,
+            leave_request.leave_type,
+            leave_request.start_date.year,
+        )
+
+        if balance.remaining_days < requested_days:
+            raise InsufficientBalanceError(
+                f"Insufficient {leave_request.leave_type.value} leave balance. "
+                f"Requested {requested_days} day(s), "
+                f"available {balance.remaining_days} day(s)"
+            )
+
+        balance.used_days += requested_days
+
+    leave_request.status = decision
+    leave_request.approved_by = approver.id
+    leave_request.approved_at = datetime.now(timezone.utc)
+
+    db.commit()
+    db.refresh(leave_request)
+
+    return leave_request
 
 
 def cancel_leave_request(
@@ -78,13 +144,38 @@ def cancel_leave_request(
     leave_request_id: int,
     employee_id: int,
 ) -> LeaveRequest:
-    """
-    Cancel a leave request.
-    - Only the owner can cancel
-    - Can only cancel PENDING or APPROVED leaves
-    - Cancelling an approved leave restores balance
-    """
-    raise NotImplementedError("Candidate must implement this")
+    leave_request = get_leave_request_or_raise(db, leave_request_id)
+    get_employee_or_raise(db, employee_id)
+
+    if leave_request.employee_id != employee_id:
+        raise LeaveError("Only the leave request owner can cancel this request")
+
+    try:
+        ensure_leave_can_be_cancelled(leave_request)
+    except ValueError as exc:
+        raise CannotModifyApprovedLeaveError(str(exc)) from exc
+
+    if leave_request.status == LeaveStatus.APPROVED:
+        requested_days = calculate_leave_days(
+            leave_request.start_date,
+            leave_request.end_date,
+        )
+
+        balance = get_balance_or_raise(
+            db,
+            leave_request.employee_id,
+            leave_request.leave_type,
+            leave_request.start_date.year,
+        )
+
+        balance.used_days = max(0, balance.used_days - requested_days)
+
+    leave_request.status = LeaveStatus.CANCELLED
+
+    db.commit()
+    db.refresh(leave_request)
+
+    return leave_request
 
 
 def get_leave_requests(
@@ -97,11 +188,32 @@ def get_leave_requests(
     page: int = 1,
     page_size: int = 20,
 ) -> tuple[list[LeaveRequest], int]:
-    """
-    List leave requests with filtering and pagination.
-    Returns (items, total_count).
-    """
-    raise NotImplementedError("Candidate must implement this")
+    if page < 1:
+        raise LeaveError("Page must be greater than or equal to 1")
+
+    if page_size < 1:
+        raise LeaveError("Page size must be greater than or equal to 1")
+
+    query = repositories.query_leave_requests(
+        db,
+        employee_id=employee_id,
+        status=status,
+        leave_type=leave_type,
+        from_date=from_date,
+        to_date=to_date,
+    )
+
+    total_count = query.count()
+
+    items = (
+        query
+        .order_by(LeaveRequest.start_date.desc(), LeaveRequest.id.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+
+    return items, total_count
 
 
 def get_leave_balances(
@@ -109,10 +221,11 @@ def get_leave_balances(
     employee_id: int,
     year: Optional[int] = None,
 ) -> list[LeaveBalance]:
-    """
-    Get leave balances for an employee for a given year (defaults to current year).
-    """
-    raise NotImplementedError("Candidate must implement this")
+    get_employee_or_raise(db, employee_id)
+
+    balance_year = year or date.today().year
+
+    return repositories.list_leave_balances(db, employee_id, balance_year)
 
 
 def seed_demo_data(db: Session) -> None:
